@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
@@ -20,7 +21,11 @@ namespace WandEnhancer.Core.Services
         private const int SettleIntervalMs = 2000;
         private const int SettleStableReads = 3;
         private const int SettleTimeoutMs = 10 * 60 * 1000;
-        private static readonly TimeSpan SelfCheckInterval = TimeSpan.FromMinutes(10);
+        private static readonly TimeSpan SelfCheckInterval = TimeSpan.FromMinutes(1);
+        private static int _checking;
+        private static string _deferredVersion;
+        private static string _failedVersion;
+        private static DateTime _retryAfterUtc;
 
         public static string MutexName(string squirrelRoot) => "Global\\WandEnhancer.Watcher." + HashOf(squirrelRoot);
 
@@ -71,12 +76,19 @@ namespace WandEnhancer.Core.Services
             })
             {
                 watcher.Created += (sender, e) => OnEntryCreated(e, squirrelRoot, log);
+                watcher.Renamed += (sender, e) => OnEntryCreated(e, squirrelRoot, log);
+                watcher.Error += (sender, e) =>
+                {
+                    log?.Invoke($"[WATCHER] File watcher lost events: {e.GetException()?.Message}. Checking installed versions again.", ELogType.Warn);
+                    QueueCheck(null, squirrelRoot, log);
+                };
                 watcher.EnableRaisingEvents = true;
                 log?.Invoke($"[WATCHER] Watching {squirrelRoot} for new Wand versions.", ELogType.Info);
 
-                // Self-check periodically as a safety net: Stop() should be the normal path, but
-                // if the saved config vanished some other way (the app folder was removed by
-                // hand, say) there would otherwise be nothing left to tell this to exit.
+                // Catch updates installed while Windows was shut down, before the Run key
+                // started us, or while FileSystemWatcher wasn't listening.
+                QueueCheck(null, squirrelRoot, log);
+
                 while (!stop.WaitOne(SelfCheckInterval))
                 {
                     if (!IsStillWanted(squirrelRoot))
@@ -84,6 +96,10 @@ namespace WandEnhancer.Core.Services
                         log?.Invoke("[WATCHER] Auto-apply is no longer configured; exiting.", ELogType.Info);
                         return;
                     }
+
+                    // Also handles missed/overflowed notifications and an update that was
+                    // only half installed when the directory-created event first arrived.
+                    QueueCheck(null, squirrelRoot, log);
                 }
 
                 log?.Invoke("[WATCHER] Stop requested; exiting.", ELogType.Info);
@@ -98,14 +114,70 @@ namespace WandEnhancer.Core.Services
                 return;
             }
 
-            // Off the watcher thread: settling and patching can take a while and must not block
-            // FileSystemWatcher from raising further events.
-            ThreadPool.QueueUserWorkItem(_ => TryPatchNewVersion(e.FullPath, squirrelRoot, log));
+            QueueCheck(e.FullPath, squirrelRoot, log);
+        }
+
+        private static void QueueCheck(string versionRoot, string squirrelRoot, Action<string, ELogType> log)
+        {
+            // Multiple Squirrel events can describe one install. Never patch two versions
+            // concurrently; a periodic reconciliation will retry if an event arrived busy.
+            if (Interlocked.CompareExchange(ref _checking, 1, 0) != 0)
+            {
+                return;
+            }
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    if (!IsStillWanted(squirrelRoot))
+                    {
+                        return;
+                    }
+
+                    if (versionRoot == null)
+                    {
+                        var latest = WeModInstalls.FindLatestWeMod(squirrelRoot);
+                        if (latest == null || Enhancer.IsPatched(latest.RootDirectory))
+                        {
+                            return;
+                        }
+
+                        versionRoot = latest.RootDirectory;
+                    }
+
+                    TryPatchNewVersion(versionRoot, squirrelRoot, log);
+                }
+                catch (Exception e)
+                {
+                    log?.Invoke($"[WATCHER] Could not check installed versions: {e.Message}", ELogType.Warn);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _checking, 0);
+                }
+            });
         }
 
         private static void TryPatchNewVersion(string versionRoot, string squirrelRoot, Action<string, ELogType> log)
         {
-            log?.Invoke($"[WATCHER] New version folder detected: {versionRoot}", ELogType.Info);
+            if (!IsStillWanted(squirrelRoot))
+            {
+                return;
+            }
+
+            if (_failedVersion != null && PathsEqual(_failedVersion, versionRoot) &&
+                DateTime.UtcNow < _retryAfterUtc)
+            {
+                return;
+            }
+
+            if (Enhancer.IsPatched(versionRoot))
+            {
+                return;
+            }
+
+            log?.Invoke($"[WATCHER] Unpatched version found: {versionRoot}", ELogType.Info);
 
             if (!WaitForSettled(versionRoot))
             {
@@ -138,16 +210,58 @@ namespace WandEnhancer.Core.Services
                 return;
             }
 
+            // Enhancer.Patch kills Wand processes before editing the archive. Never
+            // interrupt an active game or session; the next check after exit will retry.
+            if (IsWandRunning())
+            {
+                if (_deferredVersion == null || !PathsEqual(_deferredVersion, versionRoot))
+                {
+                    log?.Invoke($"[WATCHER] Wand is running; deferring patch of {versionRoot} until it exits.", ELogType.Info);
+                    _deferredVersion = versionRoot;
+                }
+
+                return;
+            }
+
+            _deferredVersion = null;
+
             try
             {
                 log?.Invoke($"[WATCHER] Re-applying patches to {config.ExecutablePath}...", ELogType.Info);
                 new Enhancer(config, log, patchConfig).Patch();
+                _failedVersion = null;
                 log?.Invoke("[WATCHER] Auto-patch after update succeeded.", ELogType.Success);
             }
             catch (Exception e)
             {
-                log?.Invoke($"[WATCHER] Auto-patch after update failed: {e.Message}", ELogType.Error);
+                _failedVersion = versionRoot;
+                _retryAfterUtc = DateTime.UtcNow.AddMinutes(10);
+                log?.Invoke($"[WATCHER] Auto-patch after update failed: {e.Message}. Will retry later.", ELogType.Error);
             }
+        }
+
+        private static bool IsWandRunning()
+        {
+            foreach (var name in Constants.WeModBrandNames)
+            {
+                Process[] processes = Process.GetProcessesByName(name);
+                try
+                {
+                    if (processes.Length != 0)
+                    {
+                        return true;
+                    }
+                }
+                finally
+                {
+                    foreach (var process in processes)
+                    {
+                        process.Dispose();
+                    }
+                }
+            }
+
+            return false;
         }
 
         /// <summary>Waits for app.asar's size to stop changing, since Squirrel writes the new version in place.</summary>

@@ -56,6 +56,22 @@ $resources = Join-Path $install 'resources'
 [IO.Directory]::CreateDirectory($resources) | Out-Null
 
 try {
+    # Squirrel's version, not folder modification time, decides which install is current.
+    # Patching an older app folder can make its timestamp newer than the latest release.
+    $olderInstall = Join-Path $scratch 'app-12.61.0'
+    $newerInstall = Join-Path $scratch 'app-12.62.0'
+    foreach ($candidate in $olderInstall, $newerInstall) {
+        [IO.Directory]::CreateDirectory((Join-Path $candidate 'resources')) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $candidate 'Wand.exe'), 'fixture exe')
+        [IO.File]::WriteAllText((Join-Path $candidate 'resources\app.asar'), 'fixture asar')
+    }
+    [IO.Directory]::SetLastWriteTimeUtc($olderInstall, [DateTime]::UtcNow.AddMinutes(10))
+    [IO.Directory]::SetLastWriteTimeUtc($newerInstall, [DateTime]::UtcNow.AddMinutes(-10))
+    $installsType = $assembly.GetType('WandEnhancer.Utils.WeModInstalls', $true)
+    $findLatest = $installsType.GetMethod('FindLatestWeMod')
+    $latestInstall = $findLatest.Invoke($null, @([string]$scratch))
+    Assert-Equal $latestInstall.RootDirectory $newerInstall 'Latest Squirrel version overrides timestamps'
+
     $enhancerType = $assembly.GetType('WandEnhancer.Core.Enhancer', $true)
     $isPatched = $enhancerType.GetMethod('IsPatched')
     $hasBackup = $enhancerType.GetMethod('HasBackup')

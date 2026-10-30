@@ -35,16 +35,19 @@ namespace WandEnhancer.Core.Services
                 return;
             }
 
-            if (Mutex.TryOpenExisting(UpdateWatcherService.MutexName(squirrelRoot), out Mutex existing))
-            {
-                existing.Dispose();
-                log?.Invoke("[ENHANCER] Update watcher is already running.", ELogType.Info);
-                return;
-            }
-
             try
             {
                 string watcherPath = Path.Combine(squirrelRoot, WatcherFileName);
+
+                if (Mutex.TryOpenExisting(UpdateWatcherService.MutexName(squirrelRoot), out Mutex existing))
+                {
+                    existing.Dispose();
+                    // The Run value may have been removed even though this session's
+                    // watcher is alive. Repair it so the next sign-in stays protected.
+                    RegisterRunKey(install, watcherPath, squirrelRoot);
+                    log?.Invoke("[ENHANCER] Update watcher is already running; startup registration verified.", ELogType.Info);
+                    return;
+                }
 
                 // Skip overwriting self if this process IS the watcher being (re)started.
                 if (!string.Equals(OwnImagePath, watcherPath, StringComparison.OrdinalIgnoreCase))
@@ -56,7 +59,9 @@ namespace WandEnhancer.Core.Services
                 StartDetached(watcherPath, squirrelRoot);
                 log?.Invoke("[ENHANCER] Update watcher installed and running in the background.", ELogType.Info);
             }
-            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException || e is SecurityException)
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException ||
+                                      e is SecurityException || e is System.ComponentModel.Win32Exception ||
+                                      e is InvalidOperationException || e is ArgumentException)
             {
                 log?.Invoke($"[ENHANCER] Could not set up the background update watcher: {e.Message}", ELogType.Warn);
             }

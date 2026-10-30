@@ -124,20 +124,34 @@ namespace WandEnhancer.Utils
         {
             var appFolders = Directory.EnumerateDirectories(root)
                 .Select(folderPath => new DirectoryInfo(folderPath))
-                .Where(dirInfo => Regex.IsMatch(dirInfo.Name, @"^app-\w+"))
+                .Where(dirInfo => dirInfo.Name.StartsWith("app-", StringComparison.OrdinalIgnoreCase))
                 .Select(dirInfo => new
                 {
-                    Name = dirInfo.Name,
                     Path = dirInfo.FullName,
+                    Version = ParseAppVersion(dirInfo.Name),
                     LastModified = dirInfo.LastWriteTime
                 })
-                .OrderByDescending(item => item.LastModified)
+                // A patch itself changes folder timestamps. Prefer Squirrel's version
+                // number so a recently modified old install cannot hide a newer one.
+                .OrderByDescending(item => item.Version)
+                .ThenByDescending(item => item.LastModified)
                 .ToList();
-            
 
             return appFolders
                 .Select(folder => CheckWeModPath(folder.Path))
                 .FirstOrDefault(config => config != null);
+        }
+
+        private static Version ParseAppVersion(string directoryName)
+        {
+            string value = directoryName.Substring("app-".Length);
+            int suffix = value.IndexOfAny(new[] { '-', '+' });
+            if (suffix >= 0)
+            {
+                value = value.Substring(0, suffix);
+            }
+
+            return Version.TryParse(value, out Version version) ? version : null;
         }
     }
 }
